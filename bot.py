@@ -20,7 +20,7 @@ from telegram.ext import (
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("8386172336:AAH2vExx-jc_2HO9ddQqWOwulTQr_sBgiF0", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN. Put it in .env as BOT_TOKEN=...")
 
