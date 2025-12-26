@@ -1,554 +1,1014 @@
 import os
-import time
+import logging
+import asyncio
+import subprocess
+import signal
+import sys
 import json
-import base64
-import random
-from dataclasses import dataclass
-from urllib.parse import quote
+import threading
+import shutil
+import time
+import secrets
+from urllib.parse import quote, unquote
+from pathlib import Path
 
-import aiohttp
-from dotenv import load_dotenv
-
+import psutil
+from flask import Flask, request, render_template_string, jsonify
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
-    InlineKeyboardMarkup,
     InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    WebAppInfo,
 )
-from telegram.constants import ChatAction
 from telegram.ext import (
-    Application,
+    ApplicationBuilder,
+    ContextTypes,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    ConversationHandler,
     filters,
+    ConversationHandler,
+    CallbackQueryHandler,
 )
 
-load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-HORDE_KEY = os.getenv("HORDE_KEY", "").strip() or "0000000000"  # anonymous allowed but lowest priority
+# ================= CONFIG =================
+TOKEN = os.environ.get("TOKEN")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:8080")
 
-if not BOT_TOKEN:
-    raise RuntimeError("Missing BOT_TOKEN. Put it in .env as BOT_TOKEN=...")
+UPLOAD_DIR = "scripts"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# Pollinations (fast)
-POLL_IMAGE = "https://image.pollinations.ai/prompt/"
-POLL_TEXT = "https://text.pollinations.ai/"
-POLL_MODELS_URL = "https://image.pollinations.ai/models"
+USERS_FILE = "allowed_users.json"
+OWNERSHIP_FILE = "ownership.json"
 
-# AI Horde (free, can be slower due to queue)
-HORDE_BASE = "https://aihorde.net/api"
-HORDE_ASYNC = f"{HORDE_BASE}/v2/generate/async"
-HORDE_CHECK = f"{HORDE_BASE}/v2/generate/check"
-HORDE_STATUS = f"{HORDE_BASE}/v2/generate/status"
-HORDE_MODELS = f"{HORDE_BASE}/v2/status/models"  # list active models (huge) :contentReference[oaicite:2]{index=2}
-
-CLIENT_AGENT = "tg-image-bot:1.0 (free)"
-
-MENU = ReplyKeyboardMarkup(
-    [["🎨 Generate", "⚙️ Settings", "ℹ️ Help"]],
-    resize_keyboard=True,
-    is_persistent=True,
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
+logger = logging.getLogger(__name__)
 
-WAIT_PROMPT = 1
+running_processes = {}  # tid -> {"process": Popen, "log": path, "started_at": epoch, "last_alert": epoch}
 
-STYLE_PRESETS = {
-    "none": "",
-    "realistic": "photorealistic, natural lighting, high detail, 35mm, sharp focus",
-    "anime": "anime style, clean lineart, vibrant colors, studio quality, detailed background",
-    "logo": "minimal logo, vector style, flat design, clean geometry, centered composition",
-    "pixel": "pixel art, 16-bit, retro game style, limited palette, crisp pixels",
-}
-
-PROVIDERS = ["pollinations", "aihorde"]
+# ---------- ALERT SETTINGS ----------
+ENABLE_ALERTS = os.environ.get("ENABLE_ALERTS", "1") == "1"
+HEALTHCHECK_INTERVAL_SEC = int(os.environ.get("HEALTHCHECK_INTERVAL_SEC", "20"))
+ALERT_COOLDOWN_SEC = int(os.environ.get("ALERT_COOLDOWN_SEC", "180"))
+CPU_ALERT_PERCENT = float(os.environ.get("CPU_ALERT_PERCENT", "85"))
+RAM_ALERT_MB = float(os.environ.get("RAM_ALERT_MB", "350"))
 
 
-@dataclass
-class UserSettings:
-    width: int = 1024
-    height: int = 1024
-    style: str = "none"
-    provider: str = "pollinations"   # pollinations | aihorde
-    model: str | None = None         # pollinations model (optional)
-    horde_model: str | None = None   # aihorde model name (optional)
-
-
-def get_settings(context: ContextTypes.DEFAULT_TYPE) -> UserSettings:
-    if "settings" not in context.user_data:
-        context.user_data["settings"] = UserSettings().__dict__
-    return UserSettings(**context.user_data["settings"])
-
-
-def save_settings(context: ContextTypes.DEFAULT_TYPE, s: UserSettings) -> None:
-    context.user_data["settings"] = s.__dict__
-
-
-def settings_text(s: UserSettings) -> str:
+# ================= HELPERS =================
+def is_user_file_id(tid: str) -> bool:
     return (
-        "⚙️ Settings\n\n"
-        f"• Provider: {s.provider}\n"
-        f"• Size: {s.width}×{s.height}\n"
-        f"• Style: {s.style}\n"
-        f"• Pollinations model: {s.model or 'default'}\n"
-        f"• AI Horde model: {s.horde_model or 'auto'}\n"
+        isinstance(tid, str)
+        and tid.startswith("u")
+        and ("|" in tid)
+        and tid.count("|") == 1
+        and tid.split("|", 1)[0][1:].isdigit()
     )
 
+def is_repo_id(tid: str) -> bool:
+    return ("|" in tid) and (not is_user_file_id(tid))
 
-def settings_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧠 Provider", callback_data="set:provider")],
-        [InlineKeyboardButton("📐 Size", callback_data="set:size")],
-        [InlineKeyboardButton("🎭 Style", callback_data="set:style")],
-        [InlineKeyboardButton("🧩 Pollinations Model", callback_data="set:poll_model")],
-        [InlineKeyboardButton("🧩 AI Horde Model", callback_data="set:horde_model")],
-    ])
+def safe_q(s: str) -> str:
+    return quote(s, safe="")
 
-
-def provider_keyboard(current: str) -> InlineKeyboardMarkup:
-    rows = []
-    for p in PROVIDERS:
-        label = ("✅ " if p == current else "") + p
-        rows.append([InlineKeyboardButton(label, callback_data=f"provider:{p}")])
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="set:back")])
-    return InlineKeyboardMarkup(rows)
+def safe_status_url(tid: str, key: str) -> str:
+    return f"{BASE_URL}/status?script={safe_q(tid)}&key={safe_q(key)}"
 
 
-def size_keyboard(w: int, h: int) -> InlineKeyboardMarkup:
-    presets = [(512, 512), (768, 768), (1024, 1024), (1024, 768), (768, 1024)]
-    rows, row = [], []
-    for pw, ph in presets:
-        label = f"{pw}×{ph}"
-        if (pw, ph) == (w, h):
-            label = "✅ " + label
-        row.append(InlineKeyboardButton(label, callback_data=f"size:{pw}x{ph}"))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="set:back")])
-    return InlineKeyboardMarkup(rows)
-
-
-def style_keyboard(current: str) -> InlineKeyboardMarkup:
-    keys = ["none", "realistic", "anime", "logo", "pixel"]
-    rows = []
-    for i in range(0, len(keys), 2):
-        r = []
-        for k in keys[i:i+2]:
-            label = ("✅ " if k == current else "") + k
-            r.append(InlineKeyboardButton(label, callback_data=f"style:{k}"))
-        rows.append(r)
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="set:back")])
-    return InlineKeyboardMarkup(rows)
-
-
-def gen_action_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Generate", callback_data="gen:go"),
-         InlineKeyboardButton("✨ Enhance", callback_data="gen:enhance")],
-        [InlineKeyboardButton("❌ Cancel", callback_data="gen:cancel")],
-    ])
-
-
-def after_send_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Regenerate", callback_data="gen:regen")]])
-
-
-def build_prompt(user_prompt: str, s: UserSettings) -> str:
-    style_suffix = STYLE_PRESETS.get(s.style, "")
-    return f"{user_prompt}, {style_suffix}".strip(", ") if style_suffix else user_prompt
-
-
-def build_pollinations_url(prompt: str, s: UserSettings) -> str:
-    encoded = quote(prompt, safe="")
-    base = f"{POLL_IMAGE}{encoded}"
-    q = [
-        f"width={max(16, min(s.width, 2048))}",
-        f"height={max(16, min(s.height, 2048))}",
-        f"seed={random.randint(1, 2_000_000_000)}",
-        "nologo=true",
-    ]
-    if s.model:
-        q.append(f"model={quote(s.model, safe='')}")
-    return base + "?" + "&".join(q)
-
-
-async def enhance_prompt(prompt: str) -> str | None:
+# ================= JSON STORE =================
+def _read_json(path: str, default):
+    if not os.path.exists(path):
+        return default
     try:
-        instruction = (
-            "Rewrite this into a strong text-to-image prompt. "
-            "Add useful visual details, lighting, camera/composition, but keep it concise. "
-            f"Prompt: {prompt}"
-        )
-        url = f"{POLL_TEXT}{quote(instruction, safe='')}"
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
-            async with session.get(url) as resp:
-                resp.raise_for_status()
-                return (await resp.text()).strip()
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
-        return None
+        return default
+
+def _write_json(path: str, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+def get_allowed_users():
+    return _read_json(USERS_FILE, [])
+
+def save_allowed_user(uid: int) -> bool:
+    users = get_allowed_users()
+    if uid not in users:
+        users.append(uid)
+        _write_json(USERS_FILE, users)
+        return True
+    return False
+
+def remove_allowed_user(uid: int) -> bool:
+    users = get_allowed_users()
+    if uid in users:
+        users.remove(uid)
+        _write_json(USERS_FILE, users)
+        return True
+    return False
+
+def load_ownership():
+    return _read_json(OWNERSHIP_FILE, {})
+
+def save_ownership_record(tid: str, record: dict):
+    data = load_ownership()
+    data[tid] = record
+    _write_json(OWNERSHIP_FILE, data)
+
+def delete_ownership(tid: str):
+    data = load_ownership()
+    if tid in data:
+        del data[tid]
+        _write_json(OWNERSHIP_FILE, data)
+
+def get_owner(tid: str):
+    return load_ownership().get(tid, {}).get("owner")
+
+def get_app_key(tid: str):
+    return load_ownership().get(tid, {}).get("key")
+
+def get_entry(tid: str):
+    return load_ownership().get(tid, {}).get("entry")
+
+def set_last_run(tid: str, value: bool):
+    data = load_ownership()
+    if tid in data:
+        data[tid]["last_run"] = bool(value)
+        _write_json(OWNERSHIP_FILE, data)
 
 
-async def fetch_poll_models() -> list[str] | None:
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
-            async with session.get(POLL_MODELS_URL) as resp:
-                resp.raise_for_status()
-                return await resp.json()
-    except Exception:
-        return None
-
-
-async def fetch_horde_models() -> list[str] | None:
-    # Output is large; we show only first ~20 in UI
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
-            async with session.get(HORDE_MODELS) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
-
-        names: list[str] = []
-        if isinstance(data, list):
-            for item in data:
-                if isinstance(item, str):
-                    names.append(item)
-                elif isinstance(item, dict):
-                    for k in ("name", "model", "model_name", "id"):
-                        if item.get(k):
-                            names.append(str(item[k]))
-                            break
-        return [n for n in names if n][:200]
-    except Exception:
-        return None
-
-
-async def aihorde_generate_image(prompt: str, s: UserSettings) -> bytes:
+# ================= PATHS =================
+def resolve_paths(tid: str):
     """
-    AI Horde flow:
-      1) POST /v2/generate/async -> returns id
-      2) poll GET /v2/generate/check/{id} until done
-      3) GET /v2/generate/status/{id} -> generations[0].img (base64 or url)
-    stablehordeapi-py docs show this structure. :contentReference[oaicite:3]{index=3}
+    user file: u<uid>|filename.py -> scripts/<uid>/
+    repo: repoName|path/to/file.py -> scripts/<repoName>/
     """
-    headers = {"apikey": HORDE_KEY, "Client-Agent": CLIENT_AGENT}
-    payload = {
-        "prompt": prompt,
-        "params": {
-            "width": max(64, min(s.width, 2048)),
-            "height": max(64, min(s.height, 2048)),
-            "steps": 25,
-            "cfg_scale": 7,
-            "sampler_name": "k_euler_a",
-        },
-        "nsfw": False,
-        "censor_nsfw": True,
-        "n": 1,
-    }
-    if s.horde_model:
-        payload["models"] = [s.horde_model]
+    if is_user_file_id(tid):
+        u, filename = tid.split("|", 1)
+        uid = u[1:]
+        work_dir = os.path.join(UPLOAD_DIR, uid)
+        env_path = os.path.join(work_dir, ".env")
+        req_path = os.path.join(work_dir, "requirements.txt")
+        full_script_path = os.path.join(work_dir, filename)
+        return work_dir, filename, env_path, req_path, full_script_path
 
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180)) as session:
-        async with session.post(HORDE_ASYNC, headers=headers, json=payload) as resp:
-            resp.raise_for_status()
-            r = await resp.json()
-            gen_id = r.get("id")
-            if not gen_id:
-                raise RuntimeError(f"AI Horde bad response: {r}")
+    if is_repo_id(tid):
+        repo, file = tid.split("|", 1)
+        work_dir = os.path.join(UPLOAD_DIR, repo)
+        env_path = os.path.join(work_dir, ".env")
+        req_path = os.path.join(work_dir, "requirements.txt")
+        full_script_path = os.path.join(work_dir, file)
+        return work_dir, file, env_path, req_path, full_script_path
 
-        # poll
-        deadline = time.time() + 160
-        while True:
-            if time.time() > deadline:
-                raise TimeoutError("AI Horde queue timeout. Try again or switch to Pollinations (fast).")
-
-            async with session.get(f"{HORDE_CHECK}/{gen_id}", headers=headers) as resp:
-                resp.raise_for_status()
-                chk = await resp.json()
-
-            done_val = chk.get("done")
-            done = (done_val is True) or (done_val == 1) or (done_val == "1")
-
-            if done:
-                break
-            await asyncio_sleep(1.2)
-
-        async with session.get(f"{HORDE_STATUS}/{gen_id}", headers=headers) as resp:
-            resp.raise_for_status()
-            st = await resp.json()
-
-        gens = st.get("generations") or []
-        if not gens:
-            raise RuntimeError(f"No generations returned: {st}")
-
-        img_field = gens[0].get("img")
-        if not img_field:
-            raise RuntimeError(f"Missing image field: {gens[0]}")
-
-        # Sometimes it's base64, sometimes it's a URL (if r2 is enabled in some clients). :contentReference[oaicite:4]{index=4}
-        if isinstance(img_field, str) and img_field.startswith("http"):
-            async with session.get(img_field) as rimg:
-                rimg.raise_for_status()
-                return await rimg.read()
-
-        return base64.b64decode(img_field.encode("utf-8"))
+    # legacy fallback
+    work_dir = UPLOAD_DIR
+    env_path = os.path.join(work_dir, f"{tid}.env")
+    req_path = os.path.join(work_dir, f"{tid}_req.txt")
+    full_script_path = os.path.join(work_dir, tid)
+    return work_dir, tid, env_path, req_path, full_script_path
 
 
-async def asyncio_sleep(sec: float) -> None:
-    # tiny helper (keeps imports minimal)
-    import asyncio
-    await asyncio.sleep(sec)
+def within_dir(base: str, p: str) -> bool:
+    base_abs = os.path.abspath(base)
+    p_abs = os.path.abspath(p)
+    return p_abs.startswith(base_abs + os.sep) or p_abs == base_abs
+
+def list_files_safe(work_dir: str, max_files: int = 400):
+    out = []
+    base = Path(work_dir)
+    if not base.exists():
+        return out
+    for path in base.rglob("*"):
+        if len(out) >= max_files:
+            break
+        if path.is_file():
+            rel = str(path.relative_to(base))
+            if rel.startswith(".git/") or rel.startswith("node_modules/"):
+                continue
+            if rel.endswith(".pyc"):
+                continue
+            out.append(rel)
+    out.sort()
+    return out
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    s = get_settings(context)
-    save_settings(context, s)
-    await update.message.reply_text(
-        "Hi! Use the buttons.\n\n"
-        "🎨 Generate → send prompt → tap Generate\n"
-        "⚙️ Settings → provider/size/style\n",
-        reply_markup=MENU,
-    )
-
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "ℹ️ Help\n\n"
-        "• Tap 🎨 Generate\n"
-        "• Send prompt\n"
-        "• Tap ✅ Generate (or ✨ Enhance)\n\n"
-        "Tip: Provider=Pollinations is fastest. AI Horde is free but can queue.",
-        reply_markup=MENU,
-    )
-
-
-async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    txt = (update.message.text or "").strip()
-
-    if txt == "🎨 Generate":
-        await update.message.reply_text("📝 Send your prompt now.", reply_markup=MENU)
-        return WAIT_PROMPT
-
-    if txt == "⚙️ Settings":
-        s = get_settings(context)
-        await update.message.reply_text(settings_text(s), reply_markup=MENU)
-        await update.message.reply_text("Change settings:", reply_markup=settings_keyboard())
-        return ConversationHandler.END
-
-    if txt == "ℹ️ Help":
-        await help_cmd(update, context)
-        return ConversationHandler.END
-
-    # if user just types prompt
-    context.user_data["pending_prompt"] = txt
-    await update.message.reply_text("Got it. Generate or enhance?", reply_markup=gen_action_keyboard())
-    return ConversationHandler.END
-
-
-async def prompt_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    prompt = (update.message.text or "").strip()
-    if not prompt:
-        await update.message.reply_text("Send a text prompt 🙂", reply_markup=MENU)
-        return WAIT_PROMPT
-
-    context.user_data["pending_prompt"] = prompt
-    await update.message.reply_text("Prompt saved. Generate or enhance?", reply_markup=gen_action_keyboard())
-    return ConversationHandler.END
-
-
-async def gen_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    q = update.callback_query
-    await q.answer()
-    action = q.data
-
-    if action == "gen:cancel":
-        context.user_data.pop("pending_prompt", None)
-        await q.edit_message_text("Cancelled.")
-        return
-
-    if action == "gen:regen":
-        prompt = context.user_data.get("last_prompt")
-        if not prompt:
-            await q.edit_message_text("No previous prompt. Tap 🎨 Generate.")
-            return
-        context.user_data["pending_prompt"] = prompt
-        action = "gen:go"
-
-    prompt = context.user_data.get("pending_prompt")
-    if not prompt:
-        await q.edit_message_text("No prompt found. Tap 🎨 Generate.")
-        return
-
-    if action == "gen:enhance":
-        await q.edit_message_text("✨ Enhancing prompt...")
-        improved = await enhance_prompt(prompt)
-        if not improved:
-            await q.edit_message_text("Couldn’t enhance right now. Try ✅ Generate.")
-            return
-        context.user_data["pending_prompt"] = improved
-        await q.edit_message_text(
-            f"✨ Enhanced prompt:\n\n{improved}\n\nNow tap ✅ Generate.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Generate", callback_data="gen:go")],
-                [InlineKeyboardButton("❌ Cancel", callback_data="gen:cancel")],
-            ])
-        )
-        return
-
-    if action == "gen:go":
-        s = get_settings(context)
-        final_prompt = build_prompt(prompt, s)
-        context.user_data["last_prompt"] = prompt
-
-        chat = q.message.chat
-        await q.edit_message_text(f"🎨 Generating… ({s.provider})")
-        await chat.send_action(ChatAction.UPLOAD_PHOTO)
-
+# ================= RUN COMMAND =================
+def resolve_run_command(work_dir: str, script_rel: str | None):
+    pkg = os.path.join(work_dir, "package.json")
+    if os.path.exists(pkg):
         try:
-            if s.provider == "pollinations":
-                url = build_pollinations_url(final_prompt, s)
-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=90)) as session:
-                    async with session.get(url) as resp:
-                        resp.raise_for_status()
-                        img = await resp.read()
-                caption = f"✅ Pollinations\nPrompt: {prompt}\nStyle: {s.style} | {s.width}×{s.height}"
-                await chat.send_photo(photo=img, caption=caption, reply_markup=after_send_keyboard())
+            with open(pkg, "r", encoding="utf-8") as f:
+                pkgj = json.load(f)
+            scripts = pkgj.get("scripts", {})
+            if "start" in scripts and (script_rel is None or script_rel.endswith(".js")):
+                return ["npm", "start"], None
+        except Exception:
+            pass
 
-            else:
-                img = await aihorde_generate_image(final_prompt, s)
-                caption = f"✅ AI Horde\nPrompt: {prompt}\nStyle: {s.style} | {s.width}×{s.height}"
-                await chat.send_photo(photo=img, caption=caption, reply_markup=after_send_keyboard())
+    def by_ext(path_rel: str):
+        ext = path_rel.split(".")[-1].lower()
+        if ext == "js":
+            return ["node", path_rel]
+        if ext == "sh":
+            return ["bash", path_rel]
+        return ["python", "-u", path_rel]
 
-        except Exception as e:
-            await chat.send_message(
-                "❌ Generation failed.\n"
-                f"Error: {e}\n\n"
-                "Try:\n• switch Provider (Settings)\n• smaller size\n• simpler prompt"
-            )
+    if script_rel:
+        return by_ext(script_rel), script_rel
+
+    candidates = ["main.py", "app.py", "server.py", "bot.py", "index.js", "server.js", "start.sh"]
+    for c in candidates:
+        if os.path.exists(os.path.join(work_dir, c)):
+            return by_ext(c), c
+
+    for f in list_files_safe(work_dir, max_files=200):
+        if f.endswith((".py", ".js", ".sh")):
+            return by_ext(f), f
+
+    return None, None
+
+
+# ================= PROCESS MGMT =================
+def build_env(env_path: str):
+    env = os.environ.copy()
+    if os.path.exists(env_path):
+        with open(env_path, encoding="utf-8", errors="ignore") as f:
+            for l in f:
+                l = l.strip()
+                if not l or l.startswith("#") or "=" not in l:
+                    continue
+                k, v = l.split("=", 1)
+                env[k.strip()] = v.strip().strip('"').strip("'")
+    return env
+
+def restart_process_background(tid: str):
+    work_dir, script_path, env_path, _, _ = resolve_paths(tid)
+
+    # stop previous
+    if tid in running_processes:
+        try:
+            os.killpg(os.getpgid(running_processes[tid]["process"].pid), signal.SIGTERM)
+        except Exception:
+            pass
+
+    entry = get_entry(tid)
+    if is_repo_id(tid):
+        cmd, chosen = resolve_run_command(work_dir, entry)
+    else:
+        cmd, chosen = resolve_run_command(work_dir, script_path)
+
+    if not cmd:
+        logger.error("No runnable entry found for %s", tid)
         return
 
+    if is_repo_id(tid):
+        data = load_ownership()
+        if tid in data:
+            data[tid]["entry"] = chosen
+            _write_json(OWNERSHIP_FILE, data)
 
-async def settings_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    os.makedirs(work_dir, exist_ok=True)
+    env = build_env(env_path)
+
+    log_path = os.path.join(UPLOAD_DIR, f"{tid.replace('|','_')}.log")
+    log_file = open(log_path, "a", encoding="utf-8")
+
+    proc = subprocess.Popen(
+        cmd,
+        env=env,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        cwd=work_dir,
+        preexec_fn=os.setsid,
+    )
+    running_processes[tid] = {"process": proc, "log": log_path, "started_at": time.time(), "last_alert": 0}
+    set_last_run(tid, True)
+
+def stop_process(tid: str):
+    if tid in running_processes:
+        try:
+            os.killpg(os.getpgid(running_processes[tid]["process"].pid), signal.SIGTERM)
+        except Exception:
+            pass
+        running_processes.pop(tid, None)
+    set_last_run(tid, False)
+
+def clear_log(tid: str):
+    log_path = os.path.join(UPLOAD_DIR, f"{tid.replace('|','_')}.log")
+    try:
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write("")
+    except Exception:
+        pass
+
+def tail_log(tid: str, lines: int = 200) -> str:
+    log_path = os.path.join(UPLOAD_DIR, f"{tid.replace('|','_')}.log")
+    if not os.path.exists(log_path):
+        return "No logs."
+    with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+        data = f.read().splitlines()[-max(50, min(lines, 800)):]
+    return "\n".join(data) if data else "(empty)"
+
+def auto_start_last_run_apps():
+    data = load_ownership()
+    for tid, meta in data.items():
+        if meta.get("last_run") is True:
+            try:
+                restart_process_background(tid)
+            except Exception as e:
+                logger.error("Auto-start failed for %s: %s", tid, e)
+
+
+# ================= INSTALL (async, faster) =================
+async def run_cmd_async(cmd: list[str], cwd: str):
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, cwd=cwd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    out, err = await proc.communicate()
+    return proc.returncode, out.decode(errors="ignore"), err.decode(errors="ignore")
+
+async def install_dependencies(work_dir: str, update: Update):
+    msg = await update.message.reply_text("⏳ Checking deps...")
+    try:
+        req = os.path.join(work_dir, "requirements.txt")
+        if os.path.exists(req):
+            await msg.edit_text("⏳ Installing Python deps...")
+            code, _, err = await run_cmd_async([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"], cwd=work_dir)
+            if code != 0:
+                await msg.edit_text(f"❌ pip failed:\n{err[:1500]}")
+                return
+
+        pkg = os.path.join(work_dir, "package.json")
+        if os.path.exists(pkg):
+            await msg.edit_text("⏳ Installing Node deps (npm install)...")
+            code, _, err = await run_cmd_async(["npm", "install"], cwd=work_dir)
+            if code != 0:
+                await msg.edit_text(f"❌ npm failed:\n{err[:1500]}")
+                return
+
+        await msg.edit_text("✅ Dependencies Installed!")
+    except Exception as e:
+        await msg.edit_text(f"❌ Error: {e}")
+
+
+# ================= ACCESS CONTROL =================
+def restricted(func):
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        uid = update.effective_user.id
+        if uid != ADMIN_ID and uid not in get_allowed_users():
+            await update.message.reply_text("⛔ Access Denied.")
+            return
+        return await func(update, context, *args, **kwargs)
+    return wrapped
+
+
+# ================= KEYBOARDS =================
+def main_menu_keyboard(uid: int):
+    rows = [
+        ["📤 Upload File", "🌐 Clone from Git"],
+        ["📂 My Hosted Apps", "📊 Server Stats"],
+        ["🆘 Help"],
+    ]
+    if uid == ADMIN_ID:
+        rows.insert(2, ["🛠 Owner Panel"])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+def extras_keyboard():
+    return ReplyKeyboardMarkup([["➕ Add Deps", "📝 Type Env Vars"], ["🚀 RUN NOW", "🔙 Cancel"]], resize_keyboard=True)
+
+def git_extras_keyboard():
+    return ReplyKeyboardMarkup([["📝 Type Env Vars"], ["📂 Select File to Run", "🔙 Cancel"]], resize_keyboard=True)
+
+
+# ================= FLASK =================
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "🤖 Bot Host is Alive!", 200
+
+@app.route("/status")
+def status():
+    script = request.args.get("script", "")
+    key = request.args.get("key", "")
+    if not script:
+        return "Specify script", 400
+    real_key = get_app_key(script)
+    if not real_key or key != real_key:
+        return "⛔ Forbidden", 403
+    if script in running_processes and running_processes[script]["process"].poll() is None:
+        return f"✅ {script} is running.", 200
+    return f"❌ {script} is stopped.", 404
+
+LOGS_HTML = """
+<!DOCTYPE html><html><head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Logs</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+body{margin:0;font-family:sans-serif;background:#0b0d10;color:#e8e8e8}
+.header{padding:10px;background:#161a20;display:flex;gap:8px;align-items:center;position:sticky;top:0}
+.btn{padding:8px 10px;border:0;border-radius:8px;background:#2b90ff;color:#fff;font-weight:700}
+pre{margin:0;padding:12px;white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,monospace;font-size:12px}
+</style></head>
+<body>
+<div class="header">
+  <button class="btn" onclick="loadLogs()">🔄 Refresh</button>
+</div>
+<pre id="logbox">Loading...</pre>
+<script>
+var tg=window.Telegram.WebApp; tg.expand();
+async function loadLogs(){
+  const r = await fetch('/api/logs?id={{tid}}&uid={{uid}}&lines={{lines}}');
+  const t = await r.text();
+  document.getElementById('logbox').textContent=t;
+}
+loadLogs();
+</script></body></html>
+"""
+
+@app.route("/logs")
+def logs_ui():
+    tid = request.args.get("id", "")
+    uid = int(request.args.get("uid", "0"))
+    lines = int(request.args.get("lines", "250"))
+    owner = get_owner(tid)
+    if uid != ADMIN_ID and uid != owner:
+        return "⛔ Access Denied", 403
+    return render_template_string(LOGS_HTML, tid=safe_q(tid), uid=uid, lines=lines)
+
+@app.route("/api/logs")
+def logs_api():
+    tid = unquote(request.args.get("id", ""))
+    uid = int(request.args.get("uid", "0"))
+    lines = int(request.args.get("lines", "250"))
+    owner = get_owner(tid)
+    if uid != ADMIN_ID and uid != owner:
+        return "⛔ Access Denied", 403
+    return tail_log(tid, lines), 200
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
+
+
+# ================= WATCHDOG (JobQueue-safe) =================
+def _can_alert(tid: str) -> bool:
+    meta = running_processes.get(tid, {})
+    last = meta.get("last_alert", 0)
+    return (time.time() - last) >= ALERT_COOLDOWN_SEC
+
+def _mark_alerted(tid: str):
+    if tid in running_processes:
+        running_processes[tid]["last_alert"] = time.time()
+
+async def watchdog_check(application):
+    if not ENABLE_ALERTS:
+        return
+
+    ownership = load_ownership()
+    watch_list = [tid for tid, meta in ownership.items() if meta.get("last_run") is True]
+
+    for tid in watch_list:
+        rp = running_processes.get(tid)
+        is_running = rp and rp["process"].poll() is None
+
+        if not is_running:
+            if _can_alert(tid):
+                owner_id = ownership.get(tid, {}).get("owner", ADMIN_ID)
+                msg = f"⚠️ App DOWN\nApp: {tid}\nOwner: {owner_id}\nAction: Restarting now..."
+                try:
+                    await application.bot.send_message(chat_id=ADMIN_ID, text=msg)
+                    if owner_id and owner_id != ADMIN_ID:
+                        await application.bot.send_message(chat_id=owner_id, text=msg)
+                except Exception as e:
+                    logger.error("Alert send failed: %s", e)
+                _mark_alerted(tid)
+
+            # auto-restart
+            try:
+                restart_process_background(tid)
+            except Exception as e:
+                logger.error("Restart failed %s: %s", tid, e)
+            continue
+
+        # resource check
+        try:
+            pid = rp["process"].pid
+            proc = psutil.Process(pid)
+            cpu = proc.cpu_percent(interval=0.0)
+            ram_mb = proc.memory_info().rss / (1024 * 1024)
+
+            if (cpu >= CPU_ALERT_PERCENT or ram_mb >= RAM_ALERT_MB) and _can_alert(tid):
+                owner_id = ownership.get(tid, {}).get("owner", ADMIN_ID)
+                msg = (
+                    f"🚨 High Resource Usage\nApp: {tid}\n"
+                    f"CPU: {cpu:.2f}% (>= {CPU_ALERT_PERCENT}%)\n"
+                    f"RAM: {ram_mb:.2f} MB (>= {RAM_ALERT_MB} MB)"
+                )
+                await application.bot.send_message(chat_id=ADMIN_ID, text=msg)
+                if owner_id and owner_id != ADMIN_ID:
+                    await application.bot.send_message(chat_id=owner_id, text=msg)
+                _mark_alerted(tid)
+        except Exception:
+            pass
+
+
+# ================= TELEGRAM STATES =================
+WAIT_FILE, WAIT_EXTRAS, WAIT_ENV_TEXT = range(3)
+WAIT_URL, WAIT_GIT_EXTRAS, WAIT_GIT_ENV_TEXT, WAIT_SELECT_FILE = range(3, 7)
+
+
+@restricted
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("👋 Mega Hosting Bot", reply_markup=main_menu_keyboard(update.effective_user.id))
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🚫 Cancelled.", reply_markup=main_menu_keyboard(update.effective_user.id))
+    return ConversationHandler.END
+
+
+# ---- Upload Flow ----
+@restricted
+async def upload_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📤 Send file (.py, .js, .sh)", reply_markup=ReplyKeyboardMarkup([["🔙 Cancel"]], resize_keyboard=True))
+    return WAIT_FILE
+
+async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "🔙 Cancel":
+        return await cancel(update, context)
+
+    doc = update.message.document
+    if not doc:
+        return WAIT_FILE
+
+    tgfile = await doc.get_file()
+    fname = doc.file_name
+    uid = update.effective_user.id
+
+    if not fname.endswith((".py", ".js", ".sh")):
+        await update.message.reply_text("❌ Only .py/.js/.sh allowed.")
+        return WAIT_FILE
+
+    user_dir = os.path.join(UPLOAD_DIR, str(uid))
+    os.makedirs(user_dir, exist_ok=True)
+
+    path = os.path.join(user_dir, fname)
+    await tgfile.download_to_drive(path)
+
+    tid = f"u{uid}|{fname}"
+    key = secrets.token_urlsafe(16)
+
+    save_ownership_record(tid, {"owner": uid, "type": "file", "key": key, "last_run": False, "entry": fname, "created_at": int(time.time())})
+    context.user_data.update({"type": "file", "target_id": tid, "work_dir": user_dir})
+
+    await update.message.reply_text("✅ Saved.", reply_markup=extras_keyboard())
+    return WAIT_EXTRAS
+
+async def receive_extras(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = update.message.text
+    if txt == "🚀 RUN NOW":
+        return await execute_logic(update, context)
+    if txt == "🔙 Cancel":
+        return await cancel(update, context)
+
+    if txt == "📝 Type Env Vars":
+        await update.message.reply_text("Send env lines (KEY=VALUE)", reply_markup=ReplyKeyboardMarkup([["🔙 Cancel"]], resize_keyboard=True))
+        return WAIT_ENV_TEXT
+
+    if txt == "➕ Add Deps":
+        await update.message.reply_text("Send requirements.txt or package.json")
+        context.user_data["wait"] = "deps"
+        return WAIT_EXTRAS
+
+    return WAIT_EXTRAS
+
+async def receive_env_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "🔙 Cancel":
+        return await cancel(update, context)
+
+    tid = context.user_data.get("target_id")
+    work_dir, _, env_path, _, _ = resolve_paths(tid)
+    os.makedirs(work_dir, exist_ok=True)
+    with open(env_path, "a", encoding="utf-8") as f:
+        if os.path.exists(env_path) and os.path.getsize(env_path) > 0:
+            f.write("\n")
+        f.write(update.message.text.strip())
+
+    await update.message.reply_text("✅ Saved.", reply_markup=extras_keyboard())
+    return WAIT_EXTRAS
+
+async def receive_extra_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("wait") != "deps":
+        return WAIT_EXTRAS
+
+    doc = update.message.document
+    if not doc:
+        return WAIT_EXTRAS
+
+    tgfile = await doc.get_file()
+    fname = doc.file_name
+    tid = context.user_data.get("target_id")
+    work_dir = context.user_data.get("work_dir") or resolve_paths(tid)[0]
+
+    if fname not in ("requirements.txt", "package.json"):
+        await update.message.reply_text("❌ Only requirements.txt / package.json")
+        return WAIT_EXTRAS
+
+    await tgfile.download_to_drive(os.path.join(work_dir, fname))
+    context.user_data["wait"] = None
+
+    # install non-blocking
+    await install_dependencies(work_dir, update)
+    await update.message.reply_text("Done. Next?", reply_markup=extras_keyboard())
+    return WAIT_EXTRAS
+
+
+# ---- Git Flow ----
+@restricted
+async def git_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🌐 Send Git URL", reply_markup=ReplyKeyboardMarkup([["🔙 Cancel"]], resize_keyboard=True))
+    return WAIT_URL
+
+async def receive_git_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text
+    if url == "🔙 Cancel":
+        return await cancel(update, context)
+
+    uid = update.effective_user.id
+    base_repo = url.split("/")[-1].replace(".git", "")
+    repo_name = f"{base_repo}_u{uid}"
+    repo_path = os.path.join(UPLOAD_DIR, repo_name)
+
+    if os.path.exists(repo_path):
+        shutil.rmtree(repo_path, ignore_errors=True)
+
+    msg = await update.message.reply_text("⏳ Cloning repo...")
+    code, _, err = await run_cmd_async(["git", "clone", url, repo_path], cwd=UPLOAD_DIR)
+    if code != 0:
+        await msg.edit_text(f"❌ Clone failed:\n{err[:1500]}")
+        return ConversationHandler.END
+
+    await msg.edit_text("✅ Cloned. Installing deps...")
+    await install_dependencies(repo_path, update)
+
+    placeholder_tid = f"{repo_name}|PLACEHOLDER"
+    key = secrets.token_urlsafe(16)
+    save_ownership_record(placeholder_tid, {"owner": uid, "type": "repo", "key": key, "last_run": False, "entry": None, "created_at": int(time.time())})
+
+    context.user_data.update({"repo_path": repo_path, "repo_name": repo_name, "target_id": placeholder_tid, "type": "repo", "work_dir": repo_path})
+    await update.message.reply_text("Now select file to run.", reply_markup=git_extras_keyboard())
+    return WAIT_GIT_EXTRAS
+
+async def receive_git_extras(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = update.message.text
+    if txt == "🔙 Cancel":
+        return await cancel(update, context)
+    if txt == "📝 Type Env Vars":
+        await update.message.reply_text("Send env lines (KEY=VALUE)", reply_markup=ReplyKeyboardMarkup([["🔙 Cancel"]], resize_keyboard=True))
+        return WAIT_GIT_ENV_TEXT
+    if txt == "📂 Select File to Run":
+        return await show_file_selection(update, context)
+    return WAIT_GIT_EXTRAS
+
+async def show_file_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    repo_path = context.user_data.get("repo_path")
+    if not repo_path:
+        await update.message.reply_text("❌ Repo not found.")
+        return ConversationHandler.END
+
+    files = [f for f in list_files_safe(repo_path) if f.endswith((".py", ".js", ".sh"))]
+    if not files:
+        await update.message.reply_text("❌ No runnable files found.")
+        return ConversationHandler.END
+
+    keyboard = [[InlineKeyboardButton(f, callback_data=f"sel_run__{f}")] for f in files[:40]]
+    await update.message.reply_text("👇 Select file to RUN:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return WAIT_SELECT_FILE
+
+async def select_git_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    s = get_settings(context)
+    filename = q.data.split("sel_run__")[1]
 
-    if q.data == "set:back":
-        await q.edit_message_text("Change settings:", reply_markup=settings_keyboard())
-        return
+    repo_name = context.user_data.get("repo_name")
+    old_tid = context.user_data.get("target_id")
+    new_tid = f"{repo_name}|{filename}"
 
-    if q.data == "set:provider":
-        await q.edit_message_text("🧠 Choose provider:", reply_markup=provider_keyboard(s.provider))
-        return
+    data = load_ownership()
+    old = data.get(old_tid)
+    if old:
+        data[new_tid] = old
+        data[new_tid]["entry"] = filename
+        del data[old_tid]
+        _write_json(OWNERSHIP_FILE, data)
+    else:
+        save_ownership_record(new_tid, {"owner": update.effective_user.id, "type": "repo", "key": secrets.token_urlsafe(16), "last_run": False, "entry": filename, "created_at": int(time.time())})
 
-    if q.data.startswith("provider:"):
-        s.provider = q.data.split(":", 1)[1]
-        save_settings(context, s)
-        await q.edit_message_text(settings_text(s), reply_markup=settings_keyboard())
-        return
+    context.user_data["target_id"] = new_tid
+    await q.edit_message_text(f"✅ Selected: {filename}")
+    return await execute_logic(update, context)
 
-    if q.data == "set:size":
-        await q.edit_message_text("📐 Choose size:", reply_markup=size_keyboard(s.width, s.height))
-        return
+async def execute_logic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tid = context.user_data.get("target_id", context.user_data.get("fallback_id"))
+    if not tid:
+        if update.message:
+            await update.message.reply_text("❌ No target selected.")
+        else:
+            await update.callback_query.message.reply_text("❌ No target selected.")
+        return ConversationHandler.END
 
-    if q.data.startswith("size:"):
-        w_str, h_str = q.data.split(":", 1)[1].split("x", 1)
-        s.width, s.height = int(w_str), int(h_str)
-        save_settings(context, s)
-        await q.edit_message_text(settings_text(s), reply_markup=settings_keyboard())
-        return
+    restart_process_background(tid)
+    key = get_app_key(tid) or "no-key"
+    msg = f"🚀 Launched!\n🔒 Secure URL:\n{safe_status_url(tid, key)}"
 
-    if q.data == "set:style":
-        await q.edit_message_text("🎭 Choose style:", reply_markup=style_keyboard(s.style))
-        return
-
-    if q.data.startswith("style:"):
-        s.style = q.data.split(":", 1)[1]
-        save_settings(context, s)
-        await q.edit_message_text(settings_text(s), reply_markup=settings_keyboard())
-        return
-
-    if q.data == "set:poll_model":
-        await q.edit_message_text("🧩 Loading Pollinations models…")
-        models = await fetch_poll_models()
-        if not models:
-            await q.edit_message_text("Couldn’t load Pollinations models.", reply_markup=settings_keyboard())
-            return
-        top = models[:18]
-        rows, row = [], []
-        for m in top:
-            label = ("✅ " if s.model == m else "") + m
-            row.append(InlineKeyboardButton(label[:30], callback_data=f"pollmodel:{m}"))
-            if len(row) == 2:
-                rows.append(row)
-                row = []
-        if row:
-            rows.append(row)
-        rows.append([InlineKeyboardButton(("✅ default" if s.model is None else "default"),
-                                          callback_data="pollmodel:__default__")])
-        rows.append([InlineKeyboardButton("⬅️ Back", callback_data="set:back")])
-        await q.edit_message_text("🧩 Choose Pollinations model:", reply_markup=InlineKeyboardMarkup(rows))
-        return
-
-    if q.data.startswith("pollmodel:"):
-        m = q.data.split(":", 1)[1]
-        s.model = None if m == "__default__" else m
-        save_settings(context, s)
-        await q.edit_message_text(settings_text(s), reply_markup=settings_keyboard())
-        return
-
-    if q.data == "set:horde_model":
-        await q.edit_message_text("🧩 Loading AI Horde models… (list is big)")
-        models = await fetch_horde_models()
-        if not models:
-            await q.edit_message_text("Couldn’t load AI Horde models.", reply_markup=settings_keyboard())
-            return
-        top = models[:18]
-        rows, row = [], []
-        for m in top:
-            label = ("✅ " if s.horde_model == m else "") + m
-            row.append(InlineKeyboardButton(label[:30], callback_data=f"hordemodel:{m}"))
-            if len(row) == 2:
-                rows.append(row)
-                row = []
-        if row:
-            rows.append(row)
-        rows.append([InlineKeyboardButton(("✅ auto" if s.horde_model is None else "auto"),
-                                          callback_data="hordemodel:__auto__")])
-        rows.append([InlineKeyboardButton("⬅️ Back", callback_data="set:back")])
-        await q.edit_message_text("🧩 Choose AI Horde model:", reply_markup=InlineKeyboardMarkup(rows))
-        return
-
-    if q.data.startswith("hordemodel:"):
-        m = q.data.split(":", 1)[1]
-        s.horde_model = None if m == "__auto__" else m
-        save_settings(context, s)
-        await q.edit_message_text(settings_text(s), reply_markup=settings_keyboard())
-        return
+    if update.message:
+        await update.message.reply_text(msg, reply_markup=main_menu_keyboard(update.effective_user.id))
+    else:
+        await update.callback_query.message.reply_text(msg, reply_markup=main_menu_keyboard(update.effective_user.id))
+    return ConversationHandler.END
 
 
-def main() -> None:
-    app = Application.builder().token(BOT_TOKEN).build()
+# ================= MANAGE APPS =================
+@restricted
+async def list_hosted(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    ownership = load_ownership()
+    if not ownership:
+        return await update.message.reply_text("📂 Empty.")
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
+    keyboard = []
+    for tid, meta in ownership.items():
+        owner_id = meta.get("owner")
+        if uid == ADMIN_ID or uid == owner_id:
+            is_running = tid in running_processes and running_processes[tid]["process"].poll() is None
+            status = "🟢" if is_running else "🔴"
+            keyboard.append([InlineKeyboardButton(f"{status} {tid}", callback_data=f"man__{tid}")])
 
-    app.add_handler(CallbackQueryHandler(gen_callbacks, pattern=r"^gen:"))
-    app.add_handler(CallbackQueryHandler(settings_callbacks, pattern=r"^(set:|provider:|size:|style:|pollmodel:|hordemodel:)"))
+    await update.message.reply_text("📂 Select App:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-    conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, menu_router)],
-        states={WAIT_PROMPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, prompt_received)]},
-        fallbacks=[],
-        allow_reentry=True,
+def app_manage_buttons(tid: str, uid: int):
+    owner = get_owner(tid)
+    is_running = tid in running_processes and running_processes[tid]["process"].poll() is None
+    key = get_app_key(tid) or ""
+    status = "🟢 Running" if is_running else "🔴 Stopped"
+    text = f"⚙️ App: {tid}\nStatus: {status}"
+    if uid == ADMIN_ID:
+        text += f"\nOwner: {owner}"
+    if key:
+        text += f"\nSecure URL:\n{safe_status_url(tid, key)}"
+
+    btns = []
+    row = []
+    if is_running:
+        row.append(InlineKeyboardButton("🛑 Stop", callback_data=f"stop__{tid}"))
+    row.append(InlineKeyboardButton("🚀 Restart", callback_data=f"rerun__{tid}"))
+    btns.append(row)
+
+    btns.append([
+        InlineKeyboardButton("📜 Logs (Web)", web_app=WebAppInfo(url=f"{BASE_URL}/logs?id={safe_q(tid)}&uid={uid}&lines=250")),
+        InlineKeyboardButton("🧹 Clear Logs", callback_data=f"clrlog__{tid}"),
+    ])
+    btns.append([InlineKeyboardButton("🗑️ Delete", callback_data=f"del__{tid}")])
+    return text, InlineKeyboardMarkup(btns)
+
+async def manage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = update.effective_user.id
+    data = q.data
+
+    if data.startswith("man__"):
+        tid = data.split("man__")[1]
+        owner = get_owner(tid)
+        if uid != ADMIN_ID and uid != owner:
+            return await q.message.reply_text("⛔ Not yours.")
+        text, markup = app_manage_buttons(tid, uid)
+        return await q.edit_message_text(text, reply_markup=markup)
+
+    if data.startswith("stop__"):
+        tid = data.split("stop__")[1]
+        owner = get_owner(tid)
+        if uid != ADMIN_ID and uid != owner:
+            return await q.message.reply_text("⛔ Not yours.")
+        stop_process(tid)
+        return await q.edit_message_text(f"🛑 Stopped: {tid}")
+
+    if data.startswith("rerun__"):
+        tid = data.split("rerun__")[1]
+        owner = get_owner(tid)
+        if uid != ADMIN_ID and uid != owner:
+            return await q.message.reply_text("⛔ Not yours.")
+        restart_process_background(tid)
+        return await q.edit_message_text(f"✅ Restarted: {tid}")
+
+    if data.startswith("clrlog__"):
+        tid = data.split("clrlog__")[1]
+        owner = get_owner(tid)
+        if uid != ADMIN_ID and uid != owner:
+            return await q.message.reply_text("⛔ Not yours.")
+        clear_log(tid)
+        return await q.message.reply_text("✅ Logs cleared.")
+
+    if data.startswith("del__"):
+        tid = data.split("del__")[1]
+        owner = get_owner(tid)
+        if uid != ADMIN_ID and uid != owner:
+            return await q.message.reply_text("⛔ Not yours.")
+
+        stop_process(tid)
+        delete_ownership(tid)
+
+        work_dir, script_path, _, _, _ = resolve_paths(tid)
+        try:
+            if is_repo_id(tid):
+                shutil.rmtree(work_dir, ignore_errors=True)
+            elif is_user_file_id(tid):
+                os.remove(os.path.join(work_dir, script_path))
+        except Exception:
+            pass
+
+        return await q.edit_message_text(f"🗑️ Deleted: {tid}")
+
+
+# ================= OWNER PANEL =================
+@restricted
+async def owner_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return await update.message.reply_text("⛔ Owner only.")
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("👥 View Access List", callback_data="own__access")],
+        [InlineKeyboardButton("🧾 View Apps & Owners", callback_data="own__apps")],
+        [InlineKeyboardButton("🟢 Running", callback_data="own__running"),
+         InlineKeyboardButton("🔴 Down", callback_data="own__down")],
+        [InlineKeyboardButton("🛑 Stop ALL", callback_data="own__stopall"),
+         InlineKeyboardButton("🔄 Restart ALL last-run", callback_data="own__restartall")],
+    ])
+    await update.message.reply_text("🛠 Owner Panel", reply_markup=kb)
+
+async def owner_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    if update.effective_user.id != ADMIN_ID:
+        return await q.message.reply_text("⛔ Owner only.")
+
+    ownership = load_ownership()
+
+    if q.data == "own__access":
+        allowed = get_allowed_users()
+        text = "👥 Access List\n"
+        text += f"Owner (ADMIN_ID): {ADMIN_ID}\n"
+        if allowed:
+            text += "Allowed users:\n" + "\n".join([f"• {u}" for u in allowed])
+        else:
+            text += "Allowed users: none"
+        return await q.message.reply_text(text)
+
+    if q.data == "own__apps":
+        if not ownership:
+            return await q.message.reply_text("No apps.")
+        lines = ["🧾 Apps & Owners"]
+        for tid, meta in ownership.items():
+            lines.append(f"• {tid} -> {meta.get('owner')} | last_run={meta.get('last_run')}")
+        return await q.message.reply_text("\n".join(lines[:120]))
+
+    if q.data == "own__running":
+        lines = ["🟢 Running Apps"]
+        any_ = False
+        for tid in ownership.keys():
+            ok = tid in running_processes and running_processes[tid]["process"].poll() is None
+            if ok:
+                any_ = True
+                lines.append(f"• {tid}")
+        if not any_:
+            lines.append("None")
+        return await q.message.reply_text("\n".join(lines))
+
+    if q.data == "own__down":
+        lines = ["🔴 Down Apps (last_run=True but not running)"]
+        any_ = False
+        for tid, meta in ownership.items():
+            if meta.get("last_run") is True:
+                ok = tid in running_processes and running_processes[tid]["process"].poll() is None
+                if not ok:
+                    any_ = True
+                    lines.append(f"• {tid}")
+        if not any_:
+            lines.append("None")
+        return await q.message.reply_text("\n".join(lines))
+
+    if q.data == "own__stopall":
+        for tid in list(running_processes.keys()):
+            stop_process(tid)
+        return await q.message.reply_text("🛑 Stopped all apps.")
+
+    if q.data == "own__restartall":
+        auto_start_last_run_apps()
+        return await q.message.reply_text("🔄 Restart requested for last-run apps.")
+
+
+# ================= STATS / HELP =================
+@restricted
+async def server_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    total = len(load_ownership())
+    running = sum(1 for tid in running_processes if running_processes[tid]["process"].poll() is None)
+    await update.message.reply_text(f"📊 Apps: {total}\n🟢 Running: {running}")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🆘 Help\n"
+        "• Upload File / Clone Repo\n"
+        "• My Hosted Apps -> Manage\n"
+        "• Owner Panel (owner only)\n"
     )
-    app.add_handler(conv)
-
-    app.run_polling(close_loop=False)
 
 
+# ================= MAIN =================
 if __name__ == "__main__":
-    main()
+    # Start Flask server for Render
+    threading.Thread(target=run_flask, daemon=True).start()
+
+    if not TOKEN:
+        print("❌ ERROR: TOKEN env var not set")
+        sys.exit(1)
+
+    app_bot = ApplicationBuilder().token(TOKEN).build()
+
+    # Auto-start apps that were running before restart
+    auto_start_last_run_apps()
+
+    # Schedule watchdog properly (NO event loop error now)
+    async def watchdog_job(context: ContextTypes.DEFAULT_TYPE):
+        await watchdog_check(context.application)
+
+    if ENABLE_ALERTS:
+        app_bot.job_queue.run_repeating(watchdog_job, interval=HEALTHCHECK_INTERVAL_SEC, first=10)
+
+    # Conversations
+    conv_file = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^📤 Upload File$"), upload_start)],
+        states={
+            WAIT_FILE: [
+                MessageHandler(filters.Regex("^🔙 Cancel$"), cancel),
+                MessageHandler(filters.Document.ALL, receive_file),
+            ],
+            WAIT_EXTRAS: [
+                MessageHandler(filters.Regex("^🔙 Cancel$"), cancel),
+                MessageHandler(filters.Regex("^(🚀 RUN NOW|➕ Add Deps|📝 Type Env Vars)$"), receive_extras),
+                MessageHandler(filters.Document.ALL, receive_extra_files),
+            ],
+            WAIT_ENV_TEXT: [
+                MessageHandler(filters.Regex("^🔙 Cancel$"), cancel),
+                MessageHandler(filters.TEXT, receive_env_text),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=False,
+    )
+
+    conv_git = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^🌐 Clone from Git$"), git_start)],
+        states={
+            WAIT_URL: [
+                MessageHandler(filters.Regex("^🔙 Cancel$"), cancel),
+                MessageHandler(filters.TEXT, receive_git_url),
+            ],
+            WAIT_GIT_EXTRAS: [
+                MessageHandler(filters.Regex("^🔙 Cancel$"), cancel),
+                MessageHandler(filters.Regex("^(📝 Type Env Vars|📂 Select File to Run)$"), receive_git_extras),
+            ],
+            WAIT_GIT_ENV_TEXT: [
+                MessageHandler(filters.Regex("^🔙 Cancel$"), cancel),
+                MessageHandler(filters.TEXT, receive_env_text),
+            ],
+            WAIT_SELECT_FILE: [CallbackQueryHandler(select_git_file, pattern=r"^sel_run__")],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=False,
+    )
+
+    # Handlers
+    app_bot.add_handler(CommandHandler("start", start))
+    app_bot.add_handler(conv_file)
+    app_bot.add_handler(conv_git)
+
+    app_bot.add_handler(MessageHandler(filters.Regex("^📂 My Hosted Apps$"), list_hosted))
+    app_bot.add_handler(MessageHandler(filters.Regex("^📊 Server Stats$"), server_stats))
+    app_bot.add_handler(MessageHandler(filters.Regex("^🛠 Owner Panel$"), owner_panel))
+    app_bot.add_handler(MessageHandler(filters.Regex("^🆘 Help$"), help_command))
+
+    app_bot.add_handler(CallbackQueryHandler(owner_callback, pattern=r"^own__"))
+    app_bot.add_handler(CallbackQueryHandler(manage_callback, pattern=r"^(man__|stop__|rerun__|clrlog__|del__)"))
+
+    print("Bot is up and running!")
+    # NOTE: 409 Conflict means another instance is running with same token.
+    app_bot.run_polling(drop_pending_updates=True)
